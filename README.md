@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="header.png" alt="Abraxas Labs — uptime-kuma-setup-toctou" width="100%">
+  <img src="header.png" alt="Abraxas Labs - uptime-kuma-setup-toctou" width="100%">
 </p>
 
 <p align="center">
@@ -14,157 +14,77 @@
 
 # uptime-kuma-setup-toctou
 
-**Uptime Kuma** `2.5.5` — Louis Lam
+**Uptime Kuma** `2.5.5` - Louis Lam
 
-Unpublished Uptime Kuma source finding: concurrent unauthenticated Socket.IO setup on first-run can insert a hidden second admin, then that account can set disableAuth so new sockets auto-login as user id 1. setup does COUNT(user) then bcryptjs.hash cost 10 then INSERT. Username is UNIQUE only; there is no one-row constraint.
+First-run Socket.IO `setup` COUNTs users, bcrypts at cost 10, then INSERTs. Username is UNIQUE only. There is no transaction, mutex, or one-row constraint. Two already-connected sockets that both see `count === 0` both hash, both insert. The extra admin is invisible: there is no user-list UI.
+
+**A stranger who hits a freshly started Kuma in the same poll as the operator can plant a hidden second admin, turn auth off, and ride auto-login onto the operator's monitors.**
 
 | | |
 |---|---|
-| ID | Unpublished Uptime Kuma source finding #1 (no CVE yet) |
-| CWE | [CWE-362, CWE-367](https://cwe.mitre.org/data/definitions/367.html) |
+| ID | no CVE yet |
+| CWE | [CWE-362](https://cwe.mitre.org/data/definitions/362.html), [CWE-367](https://cwe.mitre.org/data/definitions/367.html) |
 | CVSS | **High: 7.4** `CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:N` |
 | Product | [Uptime Kuma](https://github.com/louislam/uptime-kuma) |
-| Affected | all versions **through 2.5.5** (inclusive) |
-| Patched | vendor patch — see references |
-| Auth | unauthenticated (see source map) |
+| Affected | through **2.5.5** (`c98982a`), first-run empty `user` table |
+| Auth | unauthenticated |
 | License | [GNU Affero GPL v3.0](LICENSE) |
-| Lab | `127.0.0.1` only · vendor/client disclosure pack, not a scanner |
+| Lab | `127.0.0.1` only |
 
----
+## What an attacker can do
 
-## Advisory (from the source map)
+Hit a freshly started Kuma at the same time the operator submits `/setup`. Default Docker bind is `0.0.0.0:3001`. Insert a second `user` row with a different username. Log in as that user, set `disableAuth`, and ride `R.findOne("user")` auto-login onto the operator's monitors, notifications, API keys, and settings.
 
-server.js 705-720 COUNT then bcrypt then INSERT. password-hash.js 10-12 bcrypt.hash cost 10. knex_init_db.js 54-56 username UNIQUE only. setSettings 1505-1517 disableAuth after doubleCheckPassword on socket.userID. auto-login 1757-1760 R.findOne(user) lowest id.
+After the first row commits, a later sequential `setup` is rejected. This is not "setup stays open." It is a race during the bcrypt window. Already-initialized instances with an admin are not this bug.
 
----
+A latent API-key enable/disable IDOR (`UPDATE api_key SET active=? WHERE id=?` with no `user_id`) also becomes live once two users exist. Follow-on of the extra row, not the lab oracle.
 
-## Entry
+## How I found it
 
-- **Method:** `SOCKET.IO`
-- **Path:** `setup`
-- **Router:** socket.on setup in server/server.js. COUNT user then passwordHash.generate then R.store. No transaction, no mutex, no one-row constraint.
-- **Notes:** Unauthenticated unpublished Uptime Kuma #1 CWE-362 2.5.5. First-run only. Already-connected sockets emit setup in the same poll. Witness: sqlite 1|labadmin 2|UK-SETUP-TOCTOU-WITNESS. Late sequential setup rejected. Extra user can disableAuth. Not eval. Not a reverse shell. Disclose GitHub private advisory, not a public vendor issue.
+I read [SECURITY.md](https://github.com/louislam/uptime-kuma/blob/2.5.5/SECURITY.md) first, then the skip list: eighteen published GitHub advisories, plus public Matomo `siteId` XSS, plus vendor-wontfix cloud-metadata SSRF. Then twenty-two hunts on tag **2.5.5** (`c98982a`): auth/setup/2FA, socket IDOR, HTTP/monitor SSRF, SSTI leftovers, path/LFI, real-browser, plugin/tailscale, status-page, docker.sock, prototype pollution, push/prometheus, database, monitor exec, analytics XSS, settings, websocket CSRF, frontend XSS, jobs, Apprise, maintenance, master-delta. Most of that bar returned nothing unpublished. Auth did not.
 
-### Call chain
+First-user setup is a public Socket.IO event. No login. [`setup`](https://github.com/louislam/uptime-kuma/blob/2.5.5/server/server.js) does `COUNT(user)`, then `await passwordHash.generate`, then `R.store`. [`passwordHash.generate`](https://github.com/louislam/uptime-kuma/blob/2.5.5/server/password-hash.js) is `bcrypt.hash` cost **10**. That is a nap, not a lock. `needSetup` is in-memory and only used to emit `"setup"` on connect. The write path ignores it and re-counts.
 
-- `Connect N Socket.IO clients while the user table is empty`
-- `Barrier-emit setup(labadmin) and setup(UK-SETUP-TOCTOU-WITNESS)`
-- `sqlite SELECT id, username FROM user ORDER BY id`
-- `Sequential setup after the race is rejected (initialized)`
-- `Extra user emits login then setSettings disableAuth=true`
-- `Reconnect autoLogin; prepare2FA otpauth identity is user id 1`
+The schema is username UNIQUE only. [`knex_init_db.js`](https://github.com/louislam/uptime-kuma/blob/2.5.5/db/knex_init_db.js) does not enforce one row. Same username collides (`SQLITE_CONSTRAINT`). Different usernames both land.
 
-### Lab preconditions
+I stood up `louislam/uptime-kuma:2.5.5` on loopback with `UPTIME_KUMA_DB_TYPE=sqlite` so the v2 database wizard is skipped. bcrypt cost 10 is a race, not a guarantee on the first try. `run.sh` wipes the volume and retries. Exit 2 is a miss. Fresh empty `user` table next.
 
-- Uptime Kuma 2.5.5 with an empty user table (first-run /setup)
-- UPTIME_KUMA_DB_TYPE=sqlite so the v2 database wizard is skipped
-- Default product listen is 0.0.0.0:3001; lab binds 127.0.0.1:18141
-- Already-connected Socket.IO clients emit setup in the same poll
+When it hit: sqlite `1|labadmin` and `2|UK-SETUP-TOCTOU-WITNESS`. Sequential late setup: `Uptime Kuma has been initialized`. Extra user logged in, `setSettings` `disableAuth=true`. Reconnect auto-login is `R.findOne("user")`: lowest id, the operator. `prepare2FA` otpauth identity is `labadmin`.
 
-### Witness
+Nearby [GHSA-23q2-5gf8-gjpp](https://github.com/louislam/uptime-kuma/security/advisories/GHSA-23q2-5gf8-gjpp) is disableAuth **re-enable** failing to drop sockets. Different bug.
 
-sqlite user rows 1|labadmin and 2|UK-SETUP-TOCTOU-WITNESS; late setup rejected as initialized; extra user sets disableAuth; reconnect autoLogin prepare2FA otpauth is labadmin (id 1)
+Wrong turns already recorded: one user row after concurrent setup (race miss, not a patch); `UK-SETUP-TOCTOU-WITNESS` missing because both sockets used the **same** name; treating dashboard HTML 200 as SUCCESS; a reverse shell. Theatre. The oracle is two sqlite rows, then `disableAuth` auto-login as id 1.
 
-### Not success
-
-- eval/base64/system payload
-- reverse shell
-- single user row after concurrent setup
-- UK-SETUP-TOCTOU-WITNESS missing from the user table
-- sequential late setup accepted after the race
-
----
-
-## Patch / remediation
-
-**Do this first:** Apply the vendor patch for **Uptime Kuma**. See references.
-
-**Verify after upgrade**
-
-- Re-run `uptime-kuma-setup-toctou-Abraxas-Labs.py` against the patched build: the mapped witness must **not** appear.
-- Confirm the vendor advisory / changeset in the deployed tree (see references).
-- A WAF signature is delay, not a patch.
-
-**If you cannot update immediately**
-
-- Disable or isolate the affected component.
-- Hunt for the witness condition on production (new privileged users, unexpected files, injected rows — whatever this CVE's map names).
-
----
-
-## Reproduction (authorized lab)
-
-Target **only** `http://127.0.0.1:18141` (or the loopback you bound). Do not point this script at the internet.
-
-```bash
-python3 uptime-kuma-setup-toctou-Abraxas-Labs.py
-```
-
-Success is the **witness** above in the response body. Generic 200 HTML is not it.
-
----
-
-## Lab images
-
-Loopback stack used to reproduce. Official images unless a `Dockerfile` in this folder builds from source.
-
-- [`lab/docker-compose.yml`](lab/docker-compose.yml)
-- [`lab/Dockerfile`](lab/Dockerfile)
-- [`lab/run.sh`](lab/run.sh)
-- [`lab/poc.py`](lab/poc.py)
-- [`lab/requirements.txt`](lab/requirements.txt)
-
-`./run.sh` starts `louislam/uptime-kuma:2.5.5` on loopback `:18141` (`UPTIME_KUMA_DB_TYPE=sqlite`) and runs the Socket.IO race.
+## Lab
 
 ```bash
 cd lab
 ./run.sh
 ```
 
-Publish nothing except `127.0.0.1`.
+Target **only** `http://127.0.0.1:18141`. Official image `louislam/uptime-kuma:2.5.5`, sqlite, first-run. Do not publish the port off loopback.
 
----
+```text
+user-rows [('1', 'labadmin'), ('2', 'UK-SETUP-TOCTOU-WITNESS')]
+race-count=2 witness=True
+sequential-late-setup initialized=True
+setSettings-disableAuth ack ok
+reconnect autoLogin=True loginRequired=False
+bonus-autologin-identity operator=True id1=labadmin auto_is_id1=True
+SUCCESS uptime-kuma-setup-toctou
+```
+
+## The fix
+
+Serialize `setup`: a transaction plus a one-row constraint, or a mutex around COUNT+INSERT. Do not treat `disableAuth` auto-login as `findOne` of the lowest id. Until then, do not expose first-run setup on a shared network.
 
 ## References
 
-- [github.com/louislam/uptime-kuma](https://github.com/louislam/uptime-kuma) tag 2.5.5
-- Vendor intake: [GitHub private advisory](https://github.com/louislam/uptime-kuma/security/advisories/new) plus an empty [security issue](https://github.com/louislam/uptime-kuma/issues/new?assignees=&labels=help&template=security.md) ([SECURITY.md](https://github.com/louislam/uptime-kuma/blob/2.5.5/SECURITY.md)). Do **not** open a public GitHub issue.
-
-- Abraxas Labs: [abraxaslabs.tech](https://abraxaslabs.tech) · [github.com/abraxas](https://github.com/abraxas) · [@abraxas_null](https://x.com/abraxas_null)
-
----
-
-## Records (structured)
-
-```
-# Uptime Kuma unpublished #1 — concurrent setup TOCTOU
-
-CWE: CWE-362, CWE-367
-Severity: High (HTTP/Socket.IO lab SUCCESS, 95%)
-
-## Description
-
-Unauthenticated Socket.IO `setup` on first-run does `COUNT(user)` then `bcryptjs.hash` cost 10 then `INSERT`. There is no transaction, mutex, or one-row constraint (username UNIQUE only). Concurrent already-connected clients can insert a hidden second admin. That account can set `disableAuth`; reconnect auto-login is `R.findOne("user")` = user id 1.
-
-## Product
-
-Uptime Kuma tag 2.5.5 (`c98982a`); lab image `louislam/uptime-kuma:2.5.5` on loopback `:18141`. Oracle: sqlite `1|labadmin` `2|UK-SETUP-TOCTOU-WITNESS`; late setup rejected; `disableAuth` auto-login identity is labadmin.
-```
-
----
+- [github.com/louislam/uptime-kuma](https://github.com/louislam/uptime-kuma) tag [2.5.5](https://github.com/louislam/uptime-kuma/releases/tag/2.5.5)
+- [`server.js` setup](https://github.com/louislam/uptime-kuma/blob/2.5.5/server/server.js) · [`password-hash.js`](https://github.com/louislam/uptime-kuma/blob/2.5.5/server/password-hash.js) · [`knex_init_db.js`](https://github.com/louislam/uptime-kuma/blob/2.5.5/db/knex_init_db.js)
+- Nearby, not this bug: [GHSA-23q2-5gf8-gjpp](https://github.com/louislam/uptime-kuma/security/advisories/GHSA-23q2-5gf8-gjpp)
+- [CWE-362](https://cwe.mitre.org/data/definitions/362.html) · [CWE-367](https://cwe.mitre.org/data/definitions/367.html)
 
 ## License
 
-This disclosure pack is licensed under the **GNU Affero General Public License v3.0**. See [LICENSE](LICENSE).
-
----
-
-## Disclaimer
-
-This pack is for **the vendor, the site owner, and licensed labs**. The script talks to `127.0.0.1`. Using it against systems you do not own is not authorized by Abraxas Labs. No warranty.
-
-<p align="center">
-  <a href="https://abraxaslabs.tech">abraxaslabs.tech</a> ·
-  <a href="https://github.com/abraxas">github.com/abraxas</a> ·
-  <a href="https://x.com/abraxas_null">@abraxas_null</a>
-</p>
+GNU Affero GPL v3.0. See [LICENSE](LICENSE). Loopback lab only. No warranty.
