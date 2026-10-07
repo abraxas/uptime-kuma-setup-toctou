@@ -11,6 +11,36 @@ down() {
   echo "== compose down -v =="
   docker compose -p "$COMPOSE_PROJECT_NAME" down -v --remove-orphans >/dev/null 2>&1 || true
 }
+
+compose_up_retry() {
+  local vol="$1"
+  local attempt
+  for attempt in $(seq 1 8); do
+    if docker compose -p "$COMPOSE_PROJECT_NAME" up -d; then
+      return 0
+    fi
+    echo "IOC compose-up-retry attempt=$attempt volume=$vol"
+    sleep 5
+  done
+  return 1
+}
+
+wait_socketio() {
+  local vol="$1"
+  local i code
+  for i in $(seq 1 60); do
+    code="$(curl -s -o /tmp/uptime-kuma-setup-toctou-eio -w '%{http_code}' --max-time 5 \
+      "$BASE/socket.io/?EIO=4&transport=polling" || true)"
+    if [[ "$code" == "200" ]]; then
+      echo "IOC kuma-up http=$code volume=$vol"
+      return 0
+    fi
+    echo "IOC wait i=$i http=$code volume=$vol"
+    sleep 2
+  done
+  return 1
+}
+
 trap down EXIT
 
 if [[ ! -x .venv/bin/python ]]; then
@@ -24,35 +54,14 @@ final_rc=1
 for vol in $(seq 1 "$MAX_VOLUMES"); do
   echo "== volume attempt $vol/$MAX_VOLUMES =="
   docker compose -p "$COMPOSE_PROJECT_NAME" down -v --remove-orphans >/dev/null 2>&1 || true
-  up_ok=0
-  for attempt in $(seq 1 8); do
-    if docker compose -p "$COMPOSE_PROJECT_NAME" up -d; then
-      up_ok=1
-      break
-    fi
-    echo "IOC compose-up-retry attempt=$attempt volume=$vol"
-    sleep 5
-  done
-  if [[ "$up_ok" != 1 ]]; then
+  if ! compose_up_retry "$vol"; then
     echo "FAIL docker compose up volume=$vol" | tee poc-last-run.txt
     docker compose -p "$COMPOSE_PROJECT_NAME" logs --tail=80 kuma || true
     exit 1
   fi
 
   echo "== wait for socket.io =="
-  ok=0
-  for i in $(seq 1 60); do
-    code="$(curl -s -o /tmp/uptime-kuma-setup-toctou-eio -w '%{http_code}' --max-time 5 \
-      "$BASE/socket.io/?EIO=4&transport=polling" || true)"
-    if [[ "$code" == "200" ]]; then
-      echo "IOC kuma-up http=$code volume=$vol"
-      ok=1
-      break
-    fi
-    echo "IOC wait i=$i http=$code volume=$vol"
-    sleep 2
-  done
-  if [[ "$ok" != 1 ]]; then
+  if ! wait_socketio "$vol"; then
     echo "FAIL kuma did not become ready on $BASE volume=$vol" | tee poc-last-run.txt
     docker compose -p "$COMPOSE_PROJECT_NAME" logs --tail=80 kuma || true
     exit 1
