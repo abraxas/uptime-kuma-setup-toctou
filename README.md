@@ -13,6 +13,10 @@
   &nbsp;·&nbsp;
   <a href="https://github.com/abraxas/uptime-kuma-setup-toctou">uptime-kuma-setup-toctou</a>
 </p>
+<p align="center">
+  Write-up: <a href="https://abraxaslabs.tech/research/uptime-kuma-setup-toctou"><strong>https://abraxaslabs.tech/research/uptime-kuma-setup-toctou</strong></a>
+</p>
+
 
 # uptime-kuma-setup-toctou
 
